@@ -99,6 +99,17 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extra: Rec
   res.end(text);
 }
 
+/** Send an already-serialized JSON body (same headers as sendJson). */
+function sendJsonText(res: ServerResponse, status: number, text: string, extra: Record<string, string> = {}): void {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(text),
+    'x-github-request-id': requestId(),
+    ...extra,
+  });
+  res.end(text);
+}
+
 function sendEmpty(res: ServerResponse, status: number, extra: Record<string, string> = {}): void {
   res.writeHead(status, { 'x-github-request-id': requestId(), ...extra });
   res.end();
@@ -562,6 +573,9 @@ interface Issue {
   createdAt: string;
   updatedAt: string;
   closedAt: string | null;
+  /** Serialized issueJson, valid only while jsonFp matches the live fields. */
+  jsonCache?: string | null;
+  jsonFp?: string;
 }
 interface PullFile {
   filename: string;
@@ -613,6 +627,8 @@ interface Repo {
   nextLabelId: number;
   nextCommentId: number;
   issueSeq: number;
+  /** Bumped on every git-object/ref mutation; fetch responses are cached against it. */
+  gitRev: number;
 }
 
 const repos = new Map<string, Repo>();
@@ -647,6 +663,7 @@ function createRepoRecord(name: string, description: string, isPrivate: boolean)
     nextLabelId: 1,
     nextCommentId: 1,
     issueSeq: 0,
+    gitRev: 0,
   };
   repos.set(repoKey(VIEWER_LOGIN, name), repo);
   return repo;
@@ -654,9 +671,17 @@ function createRepoRecord(name: string, description: string, isPrivate: boolean)
 
 // --- git object helpers on a repo ------------------------------------------
 
+/** Mark a repo's git state changed (invalidates cached fetch responses). */
+function touchGit(repo: Repo): void {
+  repo.gitRev += 1;
+}
+
 function putObject(repo: Repo, type: ObjType, data: Buffer): string {
   const oid = hashObject(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  if (!repo.objects.has(oid)) {
+    repo.objects.set(oid, { type, data });
+    touchGit(repo);
+  }
   return oid;
 }
 
@@ -1036,6 +1061,21 @@ function issueJson(repo: Repo, issue: Issue): Json {
   };
 }
 
+/**
+ * Serialized issueJson, memoized on the issue. The fingerprint covers every
+ * field the JSON carries (plus the live comment count), so the cache is
+ * self-invalidating: no mutation site needs to clear it.
+ */
+function issueJsonText(repo: Repo, issue: Issue): string {
+  const comments = (repo.comments.get(issue.number) ?? []).length;
+  const fp = [issue.number, issue.title, issue.body, issue.state, issue.labels.join(','), comments, issue.createdAt, issue.updatedAt, issue.closedAt ?? ''].join('\0');
+  if (issue.jsonCache != null && issue.jsonFp === fp) return issue.jsonCache;
+  const text = JSON.stringify(issueJson(repo, issue));
+  issue.jsonCache = text;
+  issue.jsonFp = fp;
+  return text;
+}
+
 function pullJson(repo: Repo, pr: PullRequest): Json {
   const headUser = userJson();
   return {
@@ -1324,6 +1364,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
           return;
         }
         repo.refs.set(ref, sha.toLowerCase());
+        touchGit(repo);
         sendJson(res, 201, { ref, node_id: Buffer.from(`Ref:${repo.id}:${ref}`).toString('base64'), url: `/api/v3/repos/${owner}/${name}/git/refs/${encodeURIComponent(ref)}`, object: { sha: sha.toLowerCase(), type: repo.objects.get(sha.toLowerCase())?.type ?? 'commit', url: `/api/v3/repos/${owner}/${name}/git/commits/${sha}` } });
         return;
       }
@@ -1541,7 +1582,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
             labels: labelNames, createdSeq: repo.issueSeq, createdAt: now, updatedAt: now, closedAt: null,
           };
           repo.issues.set(number, issue);
-          sendJson(res, 201, issueJson(repo, issue));
+          sendJsonText(res, 201, issueJsonText(repo, issue));
           return;
         }
       }
@@ -1553,7 +1594,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
           return;
         }
         if (method === 'GET') {
-          sendJson(res, 200, issueJson(repo, issue));
+          sendJsonText(res, 200, issueJsonText(repo, issue));
           return;
         }
         if (method === 'PATCH') {
@@ -1572,7 +1613,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
             issue.labels = names;
           }
           issue.updatedAt = stamp();
-          sendJson(res, 200, issueJson(repo, issue));
+          sendJsonText(res, 200, issueJsonText(repo, issue));
           return;
         }
       }
@@ -1787,7 +1828,7 @@ function v2Advertisement(): Buffer {
 }
 
 /** Closure of commits reachable from tips, stopping at shallow boundaries (their parents are not traversed). */
-function commitClosure(repo: Repo, tips: readonly string[], shallowSet: Set<string>): Map<string, number> {
+function commitClosure(repo: Repo, tips: readonly string[], shallowSet: Set<string>, maxDepth?: number): Map<string, number> {
   const dist = new Map<string, number>();
   const queue: Array<[string, number]> = tips.map((t) => [t, 0] as [string, number]);
   while (queue.length) {
@@ -1797,6 +1838,10 @@ function commitClosure(repo: Repo, tips: readonly string[], shallowSet: Set<stri
     if (!obj || obj.type !== 'commit') continue;
     dist.set(oid, d);
     if (shallowSet.has(oid)) continue;
+    // With a depth limit, parents at or beyond it can never be delivered,
+    // so do not walk them at all (a depth-1 clone of a 200-commit repo
+    // otherwise traverses the whole history per fetch).
+    if (maxDepth !== undefined && d + 1 >= maxDepth) continue;
     for (const p of parseCommit(obj.data).parents) queue.push([p, d + 1]);
   }
   return dist;
@@ -1856,7 +1901,7 @@ function computeFetch(
     }
   }
   const haveClosure = commitClosure(repo, haves, new Set(haveShallow));
-  const wantClosure = commitClosure(repo, expandedWants, stopSet);
+  const wantClosure = commitClosure(repo, expandedWants, stopSet, deepen !== null && Number.isFinite(deepen) && deepen > 0 ? deepen : undefined);
   const delivered = new Map<string, number>(wantClosure);
   const shallowOut: string[] = [];
   if (deepen !== null && Number.isFinite(deepen) && deepen > 0) {
@@ -1896,6 +1941,18 @@ function computeFetch(
   const heldObjects = objectsForCommits(repo, haveClosure.keys());
   for (const oid of heldObjects) toSend.delete(oid);
   return { toSend, shallowOut, unshallowOut };
+}
+
+/** Cache of complete fetch responses. The key carries the repo's git revision,
+ * so any object/ref mutation invalidates it; identical fetches (the bench's
+ * 50 concurrent shallow clones) then reuse one built pack. */
+const fetchCache = new Map<string, Buffer>();
+function fetchCacheKey(repo: Repo, proto: string, wants: readonly string[], haves: readonly string[], haveShallow: readonly string[], deepen: number | null, deepenSince: number | null, doneSeen: boolean): string {
+  return [repo.id, repo.gitRev, proto, doneSeen ? 'done' : 'open', wants.join(','), haves.join(','), haveShallow.join(','), deepen ?? '', deepenSince ?? ''].join('|');
+}
+function fetchCacheStore(key: string, buf: Buffer): void {
+  if (fetchCache.size > 128) fetchCache.clear();
+  fetchCache.set(key, buf);
 }
 
 async function handleGit(req: IncomingMessage, res: ServerResponse, path: string, query: URLSearchParams, method: string): Promise<void> {
@@ -1991,6 +2048,14 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
         void deepenNot;
         const { toSend, shallowOut, unshallowOut } = computeFetch(repo, wants, haves, haveShallow, deepen, deepenSince);
         const doneSeen = args.includes('done');
+        const cacheKey = fetchCacheKey(repo, 'v2', wants, haves, haveShallow, deepen, deepenSince, doneSeen);
+        if (doneSeen) {
+          const hit = fetchCache.get(cacheKey);
+          if (hit !== undefined) {
+            res.end(hit);
+            return;
+          }
+        }
         const chunks: Buffer[] = [];
         if (!doneSeen) {
           // Negotiation round still open: answer the haves, end with FLUSH.
@@ -2021,7 +2086,9 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
           chunks.push(sidebandPackets(pack));
         }
         chunks.push(FLUSH);
-        res.end(Buffer.concat(chunks));
+        const out = Buffer.concat(chunks);
+        if (doneSeen) fetchCacheStore(cacheKey, out);
+        res.end(out);
         return;
       }
       res.end(FLUSH);
@@ -2052,6 +2119,12 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
       }
     }
     const { toSend, shallowOut, unshallowOut } = computeFetch(repo, wants, haves, haveShallow, deepen, deepenSince);
+    const cacheKey0 = fetchCacheKey(repo, 'v0', wants, haves, haveShallow, deepen, deepenSince, true);
+    const hit0 = fetchCache.get(cacheKey0);
+    if (hit0 !== undefined) {
+      res.end(hit0);
+      return;
+    }
     const chunks: Buffer[] = [];
     if (haves.length === 0) chunks.push(pktLine('NAK\n'));
     else {
@@ -2069,7 +2142,9 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
       chunks.push(sidebandPackets(pack));
     }
     chunks.push(FLUSH);
-    res.end(Buffer.concat(chunks));
+    const out0 = Buffer.concat(chunks);
+    fetchCacheStore(cacheKey0, out0);
+    res.end(out0);
     return;
   }
 
@@ -2136,6 +2211,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
       repo.refs.set(cmd.ref, cmd.newOid);
       report.push(`ok ${cmd.ref}`);
     }
+    touchGit(repo);
     // The report-status stream is itself pkt-lined inside band 1, and it must
     // end with a flush packet *inside* the band-1 payload: that flush is what
     // the client's status reader sees. A bare flush after the sideband packets
