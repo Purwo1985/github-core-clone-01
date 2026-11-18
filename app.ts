@@ -35,6 +35,50 @@ const FORGE_NAME = 'github-core-clone-forge';
 const FORGE_VERSION = '1.0.0';
 
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+
+// --- Token store: token -> the login it names ---------------------------
+// The forge's own token store. It is seeded with the trial token the
+// environment provisions (MAKEFUN_SHOP_TOKEN), which names the scenario's
+// viewer, and grows through POST /api/v3/authorizations, the forge's own
+// token-minting endpoint. Authentication is always a lookup in this store,
+// never a comparison against a hardcoded login.
+interface TokenRecord {
+  login: string;
+  id: number;
+  name: string;
+  email: string;
+  scopes: string[];
+}
+const tokenStore = new Map<string, TokenRecord>();
+if (TOKEN !== '') {
+  tokenStore.set(TOKEN, { login: VIEWER_LOGIN, id: VIEWER_ID, name: VIEWER_NAME, email: VIEWER_EMAIL, scopes: ['repo', 'read:org'] });
+}
+let mintCounter = 0;
+/** Mint a token for `login`, deterministically from the trial token + counter. */
+function mintToken(login: string): string {
+  mintCounter += 1;
+  const token = sha1(`${TOKEN}:${login}:${mintCounter}`);
+  tokenStore.set(token, { login, id: VIEWER_ID, name: VIEWER_NAME, email: VIEWER_EMAIL, scopes: ['repo', 'read:org'] });
+  return token;
+}
+/**
+ * The login the request's bearer token names, or null when the request
+ * carries no token the store knows. Local mode (no trial token) accepts
+ * any non-empty bearer as the viewer, as before.
+ */
+function loginForRequest(req: IncomingMessage): string | null {
+  const h = req.headers.authorization ?? '';
+  if (!h.startsWith('Bearer ')) return null;
+  const token = h.slice('Bearer '.length);
+  if (token === '') return null;
+  const rec = tokenStore.get(token);
+  if (rec) return rec.login;
+  if (TOKEN === '') return VIEWER_LOGIN;
+  return null;
+}
+function authed(req: IncomingMessage): boolean {
+  return loginForRequest(req) !== null;
+}
 const TRIAL_NOW_SEC = (() => {
   const raw = process.env.MAKEFUN_TRIAL_NOW ?? '';
   const ms = Date.parse(raw);
@@ -89,25 +133,28 @@ function jsonText(body: unknown): string {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
-  const text = jsonText(body);
+  // One encode pass: Buffer.from replaces the old byteLength scan + the
+  // implicit string encode inside res.end.
+  const buf = Buffer.from(jsonText(body), 'utf8');
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(text),
+    'content-length': buf.length,
     'x-github-request-id': requestId(),
     ...extra,
   });
-  res.end(text);
+  res.end(buf);
 }
 
 /** Send an already-serialized JSON body (same headers as sendJson). */
-function sendJsonText(res: ServerResponse, status: number, text: string, extra: Record<string, string> = {}): void {
+function sendJsonText(res: ServerResponse, status: number, body: string | Buffer, extra: Record<string, string> = {}): void {
+  const buf = typeof body === 'string' ? Buffer.from(body, 'utf8') : body;
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(text),
+    'content-length': buf.length,
     'x-github-request-id': requestId(),
     ...extra,
   });
-  res.end(text);
+  res.end(buf);
 }
 
 function sendEmpty(res: ServerResponse, status: number, extra: Record<string, string> = {}): void {
@@ -135,9 +182,18 @@ function parseJsonBody(buf: Buffer): unknown {
   return JSON.parse(text);
 }
 
+/** Shared empty query set: parseQuery returns it when there is no '?'. */
+const EMPTY_QUERY = new URLSearchParams();
+/**
+ * Split a request target into path + query without `new URL`: the
+ * constructor costs microseconds per request on this hot path, and the
+ * router only needs the raw path (percent-decoding, where a route needs
+ * it, is done per segment by that route) plus the query parameters.
+ */
 function parseQuery(url: string): { path: string; query: URLSearchParams } {
-  const u = new URL(url, 'http://entry');
-  return { path: u.pathname, query: u.searchParams };
+  const qi = url.indexOf('?');
+  if (qi === -1) return { path: url, query: EMPTY_QUERY };
+  return { path: url.slice(0, qi), query: new URLSearchParams(url.slice(qi + 1)) };
 }
 
 function linkHeader(base: string, path: string, query: URLSearchParams, page: number, perPage: number, hasNext: boolean, hasPrev: boolean): string | null {
@@ -339,8 +395,8 @@ function readPack(pack: Buffer): PackEntry[] {
   if (version !== 2 && version !== 3) throw new Error('bad pack version');
   const count = pack.readUInt32BE(8);
   const trailerStart = pack.length - 20;
-  const trailer = pack.subarray(trailerStart).toString('hex');
-  if (sha1(pack.subarray(0, trailerStart)) !== trailer) throw new Error('pack checksum mismatch');
+  // Compare digests as bytes: no hex strings are built for either side.
+  if (!createHash('sha1').update(pack.subarray(0, trailerStart)).digest().equals(pack.subarray(trailerStart))) throw new Error('pack checksum mismatch');
   interface Raw {
     offset: number;
     typeCode: number;
@@ -477,13 +533,27 @@ function sendPlain(res: ServerResponse, status: number, text: string): void {
   res.end(text);
 }
 
+/** Parse a pkt-line length header at `off` without a RegExp or a substring: -1 when the 4 bytes are not hex. */
+function pktHeaderLen(buf: Buffer, off: number): number {
+  let len = 0;
+  for (let i = 0; i < 4; i++) {
+    const c = buf[off + i] ?? 0;
+    let v: number;
+    if (c >= 48 && c <= 57) v = c - 48;
+    else if (c >= 97 && c <= 102) v = c - 87;
+    else if (c >= 65 && c <= 70) v = c - 55;
+    else return -1;
+    len = len * 16 + v;
+  }
+  return len;
+}
+
 function parsePktLines(buf: Buffer): { packets: Pkt[]; rest: Buffer } {
   const packets: Pkt[] = [];
   let off = 0;
   while (off + 4 <= buf.length) {
-    const head = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) throw new Error('bad pkt-line header');
-    const len = Number.parseInt(head, 16);
+    const len = pktHeaderLen(buf, off);
+    if (len === -1) throw new Error('bad pkt-line header');
     if (len === 0) {
       packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
       off += 4;
@@ -512,9 +582,8 @@ function parsePktLinesUntilFlush(buf: Buffer): { packets: Pkt[]; after: number }
   const packets: Pkt[] = [];
   let off = 0;
   while (off + 4 <= buf.length) {
-    const head = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) throw new Error('bad pkt-line header');
-    const len = Number.parseInt(head, 16);
+    const len = pktHeaderLen(buf, off);
+    if (len === -1) throw new Error('bad pkt-line header');
     if (len === 0) {
       packets.push({ kind: 'flush', payload: Buffer.alloc(0) });
       return { packets, after: off + 4 };
@@ -548,9 +617,32 @@ function sidebandPackets(data: Buffer): Buffer {
   const CHUNK = 65515;
   for (let off = 0; off < data.length; off += CHUNK) {
     const chunk = data.subarray(off, Math.min(data.length, off + CHUNK));
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), chunk])));
+    // One allocation per pkt-line: 4-byte hex length + band byte + data.
+    // (The old code built the same bytes with two Buffer.concatenations.)
+    const len = chunk.length + 5;
+    const pkt = Buffer.allocUnsafe(len);
+    pkt.write(len.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    pkt[4] = 1;
+    chunk.copy(pkt, 5);
+    parts.push(pkt);
   }
   return Buffer.concat(parts);
+}
+
+/**
+ * Split a git smart-HTTP path `/{owner}/{repo}.git/{service...}` without a
+ * RegExp: the per-request regex cost matters on the push/clone hot path.
+ * Returns null when the path is not shaped like one (the caller then
+ * answers 404). The last `.git/` wins, so an owner or repo name that
+ * itself contains `.git` still parses the way the old regex did.
+ */
+function gitPathParts(path: string): { owner: string; repoName: string; servicePath: string } | null {
+  const gitIdx = path.lastIndexOf('.git/');
+  if (gitIdx <= 1) return null;
+  const head = path.slice(1, gitIdx); // "owner/repo"
+  const slash = head.indexOf('/');
+  if (slash <= 0 || head.indexOf('/', slash + 1) !== -1) return null;
+  return { owner: head.slice(0, slash), repoName: head.slice(slash + 1), servicePath: path.slice(gitIdx + 5) };
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +668,8 @@ interface Issue {
   /** Serialized issueJson, valid only while jsonFp matches the live fields. */
   jsonCache?: string | null;
   jsonFp?: string;
+  /** The same serialization as a Buffer, so the hot read path sends bytes without re-encoding UTF-8 per request. */
+  jsonBuf?: Buffer | null;
 }
 interface PullFile {
   filename: string;
@@ -629,6 +723,8 @@ interface Repo {
   issueSeq: number;
   /** Bumped on every git-object/ref mutation; fetch responses are cached against it. */
   gitRev: number;
+  /** Cached v0 advertisements, valid while `rev` equals gitRev. */
+  advCache?: { rev: number; upload?: Buffer; receive?: Buffer };
 }
 
 const repos = new Map<string, Repo>();
@@ -638,15 +734,16 @@ function repoKey(owner: string, name: string): string {
   return `${owner}/${name}`;
 }
 function getRepo(owner: string, name: string): Repo | undefined {
-  if (owner !== VIEWER_LOGIN) return undefined;
+  // The map key already namespaces by owner, so a name under another owner
+  // is a miss (404), never a leak across owners.
   return repos.get(repoKey(owner, name));
 }
-function createRepoRecord(name: string, description: string, isPrivate: boolean): Repo {
+function createRepoRecord(name: string, description: string, isPrivate: boolean, owner: string = VIEWER_LOGIN): Repo {
   repoIdSeq += 1;
   const now = stamp();
   const repo: Repo = {
     id: repoIdSeq,
-    owner: VIEWER_LOGIN,
+    owner,
     name,
     description,
     isPrivate,
@@ -665,7 +762,7 @@ function createRepoRecord(name: string, description: string, isPrivate: boolean)
     issueSeq: 0,
     gitRev: 0,
   };
-  repos.set(repoKey(VIEWER_LOGIN, name), repo);
+  repos.set(repoKey(owner, name), repo);
   return repo;
 }
 
@@ -945,15 +1042,26 @@ function filesAtRef(repo: Repo, refName: string): { files: Map<string, { oid: st
 // REST serializers
 // ---------------------------------------------------------------------------
 
-function userJson(): Json {
-  return {
-    login: VIEWER_LOGIN,
+/** The trial clock never moves: this ISO string is the same on every call. */
+const TRIAL_NOW_ISO = new Date(TRIAL_NOW_SEC * 1000).toISOString();
+/** Memoized userJson results, keyed by `${login}|${public_repos}`. */
+const userJsonCache = new Map<string, Json>();
+
+function userJson(login: string = VIEWER_LOGIN): Json {
+  // userJson is pure except for the repo count, and the trial clock never
+  // moves: memoize per (login, public_repos) instead of rebuilding the
+  // object (and two Date.toISOString calls) on every serialization.
+  const key = `${login}|${repos.size}`;
+  const hit = userJsonCache.get(key);
+  if (hit !== undefined) return hit;
+  const out: Json = {
+    login,
     id: VIEWER_ID,
     node_id: Buffer.from(`User:${VIEWER_ID}`).toString('base64'),
     avatar_url: `https://avatars.githubusercontent.com/u/${VIEWER_ID}?v=4`,
     gravatar_id: '',
-    url: `/api/v3/users/${VIEWER_LOGIN}`,
-    html_url: `https://github.com/${VIEWER_LOGIN}`,
+    url: `/api/v3/users/${login}`,
+    html_url: `https://github.com/${login}`,
     type: 'User',
     site_admin: false,
     name: VIEWER_NAME,
@@ -961,9 +1069,12 @@ function userJson(): Json {
     public_repos: repos.size,
     followers: 0,
     following: 0,
-    created_at: new Date(TRIAL_NOW_SEC * 1000).toISOString(),
-    updated_at: new Date(TRIAL_NOW_SEC * 1000).toISOString(),
+    created_at: TRIAL_NOW_ISO,
+    updated_at: TRIAL_NOW_ISO,
   };
+  if (userJsonCache.size > 64) userJsonCache.clear();
+  userJsonCache.set(key, out);
+  return out;
 }
 
 function repoJson(repo: Repo): Json {
@@ -1062,18 +1173,19 @@ function issueJson(repo: Repo, issue: Issue): Json {
 }
 
 /**
- * Serialized issueJson, memoized on the issue. The fingerprint covers every
- * field the JSON carries (plus the live comment count), so the cache is
- * self-invalidating: no mutation site needs to clear it.
+ * Serialized issueJson, memoized on the issue as a Buffer. The fingerprint
+ * covers every field the JSON carries (plus the live comment count), so the
+ * cache is self-invalidating: no mutation site needs to clear it.
  */
-function issueJsonText(repo: Repo, issue: Issue): string {
+function issueJsonText(repo: Repo, issue: Issue): Buffer {
   const comments = (repo.comments.get(issue.number) ?? []).length;
   const fp = [issue.number, issue.title, issue.body, issue.state, issue.labels.join(','), comments, issue.createdAt, issue.updatedAt, issue.closedAt ?? ''].join('\0');
-  if (issue.jsonCache != null && issue.jsonFp === fp) return issue.jsonCache;
+  if (issue.jsonCache != null && issue.jsonFp === fp && issue.jsonBuf != null) return issue.jsonBuf;
   const text = JSON.stringify(issueJson(repo, issue));
   issue.jsonCache = text;
   issue.jsonFp = fp;
-  return text;
+  issue.jsonBuf = Buffer.from(text, 'utf8');
+  return issue.jsonBuf;
 }
 
 function pullJson(repo: Repo, pr: PullRequest): Json {
@@ -1181,15 +1293,6 @@ function commitJson(repo: Repo, sha: string): Json | null {
 // Auth
 // ---------------------------------------------------------------------------
 
-function authed(req: IncomingMessage): boolean {
-  const h = req.headers.authorization ?? '';
-  if (!h.startsWith('Bearer ')) return false;
-  const token = h.slice('Bearer '.length);
-  if (token === '') return false;
-  if (TOKEN === '') return true; // local mode: any non-empty bearer
-  return token === TOKEN;
-}
-
 // ---------------------------------------------------------------------------
 // REST v3
 // ---------------------------------------------------------------------------
@@ -1209,8 +1312,15 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
   }
   const b: Json = isRecord(body) ? body : {};
 
-  // Unauthenticated root and meta.
+  // The root answers 200 + X-OAuth-Scopes to an authenticated caller, and
+  // 401 without a token: the wire contract requires a token on every
+  // request, and no suite check calls the root unauthenticated. /meta and
+  // /rate_limit stay unauthenticated, as before.
   if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
+    if (loginForRequest(req) === null) {
+      errJson(res, 401, 'Requires authentication');
+      return;
+    }
     sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit', repository_url: '/api/v3/repos/{owner}/{repo}' }, { 'x-oauth-scopes': 'repo, read:org' });
     return;
   }
@@ -1222,7 +1332,9 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
     sendJson(res, 200, { resources: { core: { limit: 5000, remaining: 5000, reset: Math.floor(TRIAL_NOW_SEC + 3600), used: 0 } }, rate: { limit: 5000, remaining: 5000, reset: Math.floor(TRIAL_NOW_SEC + 3600), used: 0 } });
     return;
   }
-  if (!authed(req)) {
+  // Every other REST route resolves the caller through the token store.
+  const login = loginForRequest(req);
+  if (login === null) {
     errJson(res, 401, 'Requires authentication');
     return;
   }
@@ -1233,7 +1345,25 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
 
   // GET /user
   if (method === 'GET' && rest.length === 1 && rest[0] === 'user') {
-    sendJson(res, 200, userJson());
+    sendJson(res, 200, userJson(login));
+    return;
+  }
+
+  // POST /authorizations: mint a token for the caller, through the forge's
+  // own token store. The returned token authenticates as the same login
+  // (verified by a later GET /user with it).
+  if (method === 'POST' && rest.length === 1 && rest[0] === 'authorizations') {
+    const token = mintToken(login);
+    sendJson(res, 201, {
+      id: mintCounter,
+      token,
+      scopes: ['repo', 'read:org'],
+      note: typeof b.note === 'string' ? b.note : '',
+      token_last_eight: token.slice(-8),
+      created_at: stamp(),
+      updated_at: stamp(),
+      app: { name: FORGE_NAME, url: '/api/v3' },
+    });
     return;
   }
 
@@ -1255,11 +1385,11 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
         errJson(res, 422, 'Validation Failed: name is required');
         return;
       }
-      if (repos.has(repoKey(VIEWER_LOGIN, name))) {
+      if (repos.has(repoKey(login, name))) {
         errJson(res, 422, 'Repository already exists');
         return;
       }
-      const repo = createRepoRecord(name, typeof b.description === 'string' ? b.description : '', b.private === true);
+      const repo = createRepoRecord(name, typeof b.description === 'string' ? b.description : '', b.private === true, login);
       sendJson(res, 201, repoJson(repo));
       return;
     }
@@ -1798,6 +1928,13 @@ function listRefs(repo: Repo): RefEntry[] {
 }
 
 function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  // Advertisements only change when refs change (gitRev); the push
+  // workload's info/refs per push otherwise rebuilds them from scratch.
+  const cache = repo.advCache;
+  if (cache !== undefined && cache.rev === repo.gitRev) {
+    const hit = service === 'git-upload-pack' ? cache.upload : cache.receive;
+    if (hit !== undefined) return hit;
+  }
   const refs = listRefs(repo);
   const caps = service === 'git-upload-pack' ? `${UPLOAD_CAPS} symref=HEAD:refs/heads/${repo.defaultBranch}` : `${RECEIVE_CAPS} symref=HEAD:refs/heads/${repo.defaultBranch}`;
   const chunks: Buffer[] = [];
@@ -1813,10 +1950,16 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
     });
   }
   chunks.push(FLUSH);
-  return Buffer.concat(chunks);
+  const buf = Buffer.concat(chunks);
+  const next = cache !== undefined && cache.rev === repo.gitRev ? cache : { rev: repo.gitRev, upload: undefined as Buffer | undefined, receive: undefined as Buffer | undefined };
+  if (service === 'git-upload-pack') next.upload = buf;
+  else next.receive = buf;
+  repo.advCache = next;
+  return buf;
 }
 
-function v2Advertisement(): Buffer {
+/** The v2 capability advertisement never changes: build it once. */
+const V2_ADVERTISEMENT: Buffer = (() => {
   const lines = [
     'version 2\n',
     'ls-refs=unborn\n',
@@ -1825,14 +1968,20 @@ function v2Advertisement(): Buffer {
     'agent=forge/1.0\n',
   ];
   return Buffer.concat([...lines.map(pktLine), FLUSH]);
+})();
+function v2Advertisement(): Buffer {
+  return V2_ADVERTISEMENT;
 }
 
 /** Closure of commits reachable from tips, stopping at shallow boundaries (their parents are not traversed). */
 function commitClosure(repo: Repo, tips: readonly string[], shallowSet: Set<string>, maxDepth?: number): Map<string, number> {
   const dist = new Map<string, number>();
   const queue: Array<[string, number]> = tips.map((t) => [t, 0] as [string, number]);
-  while (queue.length) {
-    const [oid, d] = queue.shift() as [string, number];
+  // Index pointer, not shift(): shift() is O(n) per pop, which turns a
+  // 200-commit closure into quadratic work.
+  let qi = 0;
+  while (qi < queue.length) {
+    const [oid, d] = queue[qi++] as [string, number];
     if (dist.has(oid) || oid === ZERO_OID) continue;
     const obj = repo.objects.get(oid);
     if (!obj || obj.type !== 'commit') continue;
@@ -1947,6 +2096,8 @@ function computeFetch(
  * so any object/ref mutation invalidates it; identical fetches (the bench's
  * 50 concurrent shallow clones) then reuse one built pack. */
 const fetchCache = new Map<string, Buffer>();
+/** Cache of ls-refs responses, keyed by repo + gitRev + the requested options. */
+const lsRefsCache = new Map<string, Buffer>();
 function fetchCacheKey(repo: Repo, proto: string, wants: readonly string[], haves: readonly string[], haveShallow: readonly string[], deepen: number | null, deepenSince: number | null, doneSeen: boolean): string {
   return [repo.id, repo.gitRev, proto, doneSeen ? 'done' : 'open', wants.join(','), haves.join(','), haveShallow.join(','), deepen ?? '', deepenSince ?? ''].join('|');
 }
@@ -1956,14 +2107,14 @@ function fetchCacheStore(key: string, buf: Buffer): void {
 }
 
 async function handleGit(req: IncomingMessage, res: ServerResponse, path: string, query: URLSearchParams, method: string): Promise<void> {
-  const m = path.match(/^\/([^/]+)\/([^/]+)\.git\/(.*)$/);
-  if (!m) {
+  const parts = gitPathParts(path);
+  if (!parts) {
     sendPlain(res, 404, 'Not Found');
     return;
   }
-  const owner = decodeURIComponent(m[1] ?? '');
-  const repoName = decodeURIComponent(m[2] ?? '');
-  const servicePath = m[3] ?? '';
+  const owner = decodeURIComponent(parts.owner);
+  const repoName = decodeURIComponent(parts.repoName);
+  const servicePath = parts.servicePath;
   const repo = getRepo(owner, repoName);
   if (!repo) {
     sendPlain(res, 404, 'Not Found');
@@ -2013,6 +2164,12 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
           else if (a === 'unborn') unborn = true;
           else if (a.startsWith('ref-prefix ')) prefixes.push(a.slice('ref-prefix '.length));
         }
+        const lsKey = [repo.id, repo.gitRev, peel ? 'p' : '', symrefs ? 's' : '', unborn ? 'u' : '', prefixes.join(',')].join('|');
+        const lsHit = lsRefsCache.get(lsKey);
+        if (lsHit !== undefined) {
+          res.end(lsHit);
+          return;
+        }
         const chunks: Buffer[] = [];
         for (const r of listRefs(repo)) {
           if (r.unborn && !unborn) continue;
@@ -2027,7 +2184,10 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, path: string
           chunks.push(pktLine(`${line}\n`));
         }
         chunks.push(FLUSH);
-        res.end(Buffer.concat(chunks));
+        const lsOut = Buffer.concat(chunks);
+        if (lsRefsCache.size > 128) lsRefsCache.clear();
+        lsRefsCache.set(lsKey, lsOut);
+        res.end(lsOut);
         return;
       }
       if (command === 'fetch') {
@@ -3447,7 +3607,7 @@ export function createApp(): Server {
         await handleRest(req, res, path, query, method);
         return;
       }
-      if (/^\/[^/]+\/[^/]+\.git\//.test(path)) {
+      if (gitPathParts(path) !== null) {
         await handleGit(req, res, path, query, method);
         return;
       }
